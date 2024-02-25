@@ -22,6 +22,59 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True
+    ##################################
+    # for conditioning vector (cvec) #
+    ##################################
+    # main switch
+    activate_cvec: bool = False
+    # length of cvec
+    n_input_cvec: int = 2
+    # number of prefix virtual tokens
+    n_prefix_cvec: int = 4
+    # hidden size of CVecEncoder
+    n_hidden_cvec: int = 128
+    # dropout of CVecEncoder
+    dropout_cvec: float = 0.1
+    # layer-wise strategy
+    # True: all blocks share the same key-value features
+    # False: each block uses independent key-value features;
+    #        the size of CVecEncoder will become `n_layer` times larger
+    kv_shared_by_layers_cvec: bool = False
+
+
+class CVecEncoder(torch.nn.Module):
+
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.config = config
+
+        # size of output
+        kv_size = config.n_prefix_cvec * config.n_embd * 2  # here 2 for key and value
+        if not config.kv_shared_by_layers_cvec:
+            kv_size *= config.n_layer
+        self.fnn = torch.nn.Sequential(
+            torch.nn.Linear(config.n_input_cvec, config.n_hidden_cvec),
+            torch.nn.Tanh(),
+            torch.nn.Linear(config.n_hidden_cvec, kv_size),
+            torch.nn.Tanh()
+        )
+        # dropout
+        self.dropout = torch.nn.Dropout(config.dropout_cvec)
+
+    def forward(self, x: torch.Tensor):
+        # [batch_size, n_input_cvec] => [batch_size, kv_size]
+        x = self.fnn(x)
+        # [batch_size, kv_size] => [n_layer, batch_size, n_prefix_cvec, n_embd * 2]
+        if self.config.kv_shared_by_layers_cvec:
+            x = x.view(-1, self.config.n_prefix_cvec, self.config.n_embd * 2)
+            # duplicate for layers
+            x = x.unsqueeze(0).expand(self.config.n_layer, -1, -1, -1)
+        else:
+            x = x.view(-1, self.config.n_layer, self.config.n_prefix_cvec, self.config.n_embd * 2)
+            x = x.transpose(0, 1)
+        # dropout on last dimension
+        x = self.dropout(x)
+        return x
 
 
 class LayerNorm(nn.Module):
@@ -53,19 +106,17 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+        self.n_prefix_cvec = config.n_prefix_cvec
+        if not hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+            raise RuntimeError("Flash attention (PyTorch >= 2.0) is required.")
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, kv_cvec: Tensor = None) -> Tensor:
         """
         Applies causal self-attention to the given tensor,
         with a mask to prevent attention to future positions.
 
         :param x: tensor of shape (batch size, sequence length, embedding dimension)
+        :param kv_cvec: tensor of shape (batch size, n_prefix_cvec, embedding dimension * 2)
         :returns: result of applying the causal self-attention operation
         """
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
@@ -75,17 +126,22 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        attn_mask = torch.ones(T, T, dtype=torch.bool).tril(diagonal=0).to(q.device)
+
+        # conditioning vector
+        if kv_cvec is not None:
+            P = self.n_prefix_cvec
+            k_cvec, v_cvec = kv_cvec.split(self.n_embd, dim=-1)
+            k_cvec = k_cvec.view(B, P, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, P, hs)
+            v_cvec = v_cvec.view(B, P, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, P, hs)
+            k = torch.cat((k_cvec, k), dim=2)  # (B, nh, P + T, hs)
+            v = torch.cat((v_cvec, v), dim=2)  # (B, nh, P + T, hs)
+            cvec_mask = torch.ones(T, P, dtype=torch.bool).to(q.device)
+            attn_mask = torch.cat((cvec_mask, attn_mask), dim=1)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout, is_causal=True)
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float("-inf"))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, dropout_p=self.dropout)
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
 
         y = self.resid_dropout(self.c_proj(y))
@@ -129,15 +185,16 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, kv_cvec: Tensor = None) -> Tensor:
         """
         Forward pass for the Transformer Block module. A Block module includes causal self-attention,
         layer normalization, and MLP, and residual connections.
 
         :param x: input to the transformer block
+        :param kv_cvec: key-value features of cvec
         :returns: output of the transformer block, with the same shape as in the input
         """
-        x = x + self.attn(self.ln_1(x))
+        x = x + self.attn(self.ln_1(x), kv_cvec)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -161,13 +218,18 @@ class GPT(nn.Module):
         # https://paperswithcode.com/method/weight-tying
         self.transformer.wte.weight = self.lm_head.weight
 
+        # conditioning vector
+        self.cvec_encoder = None
+        if config.activate_cvec:
+            self.cvec_encoder = CVecEncoder(config)
+
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith("c_proj.weight"):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
 
-        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+        print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
 
     def get_num_params(self, non_embedding: bool = True) -> int:
         """
@@ -191,7 +253,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, cvec=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -201,8 +263,16 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
+        if self.cvec_encoder is None:
+            assert cvec is None, "Model cannot take in CVEC input."
+            for block in self.transformer.h:
+                x = block(x, None)
+        else:
+            assert cvec is not None, "Model requires CVEC input."
+            kv_cvec = self.cvec_encoder(cvec)
+            for i_block, block in enumerate(self.transformer.h):
+                x = block(x, kv_cvec[i_block])
+
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -211,7 +281,7 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(x[:, [-1], :])  # note: using list [-1] to preserve the time dim
             loss = None
 
         return logits, loss
@@ -224,7 +294,7 @@ class GPT(nn.Module):
         self.config.block_size = block_size
         self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
-            block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
+            block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
 
     def configure_optimizers(self, weight_decay, learning_rate, betas):
         """
@@ -237,11 +307,11 @@ class GPT(nn.Module):
         # separate out all parameters to those that will and won't experience regularizing weight decay
         decay = set()
         no_decay = set()
-        whitelist_weight_modules = (torch.nn.Linear, )
+        whitelist_weight_modules = (torch.nn.Linear,)
         blacklist_weight_modules = (torch.nn.LayerNorm, LayerNorm, torch.nn.Embedding)
         for mn, m in self.named_modules():
             for pn, p in m.named_parameters():
-                fpn = "%s.%s" % (mn, pn) if mn else pn # full param name
+                fpn = "%s.%s" % (mn, pn) if mn else pn  # full param name
                 # random note: because named_modules and named_parameters are recursive
                 # we will see the same tensors p many many times. but doing it this way
                 # allows us to know which parent module any tensor p belongs to...
@@ -267,9 +337,10 @@ class GPT(nn.Module):
         param_dict = {pn: p for pn, p in self.named_parameters()}
         inter_params = decay & no_decay
         union_params = decay | no_decay
-        assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params), )
-        assert len(param_dict.keys() - union_params) == 0, "parameters %s were not separated into either decay/no_decay set!" \
-                                                    % (str(param_dict.keys() - union_params), )
+        assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params),)
+        assert len(
+            param_dict.keys() - union_params) == 0, "parameters %s were not separated into either decay/no_decay set!" \
+                                                    % (str(param_dict.keys() - union_params),)
 
         # create the pytorch optimizer object
         optim_groups = [
@@ -286,18 +357,19 @@ class GPT(nn.Module):
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
         N = self.get_num_params()
         cfg = self.config
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
-        flops_per_token = 6*N + 12*L*H*Q*T
+        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd // cfg.n_head, cfg.block_size
+        flops_per_token = 6 * N + 12 * L * H * Q * T
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
         # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0/dt)  # per second
+        flops_achieved = flops_per_iter * (1.0 / dt)  # per second
         flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS
         mfu = flops_achieved / flops_promised
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None,
+                 cvec=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -310,7 +382,7 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _ = self(idx_cond, cvec=cvec)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options

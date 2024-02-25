@@ -1,0 +1,34 @@
+out_dir: "out/finetuning"
+eval_interval: 2  # how often to evaluate against the validation set
+eval_iters_train: 2
+eval_iters_val: 2
+log_interval: 1  # how often to print to the console (1 = every iteration)
+
+# whether to always save a checkpoint
+always_save_checkpoint: True
+init_from: resume
+
+dataset: "data/finetuning"
+batch_size: 64
+block_size: 2048  # context of up to `block_size` previous characters
+
+# architecture
+n_layer: 2  # just use a small GTP with two blocks
+n_head: 6
+n_embd: 384
+dropout: 0.2
+
+# conditioning vectors
+activate_cvec: True
+n_input_cvec: 2  # must be the same as that for gen_fake_cvec.py
+
+learning_rate: 1e-3
+max_iters: 2  # just run 2 epochs
+lr_decay_iters: 2000  # make equal to max_iters usually
+min_lr: 1e-4  # learning_rate / 10 usually
+beta2: 0.99  # make a bit bigger because number of tokens per iter is small
+
+warmup_iters: 1  # not super necessary potentially
+
+dtype: float16  # [Kuangdai] my GPU does not support bfloat16
+compile: False # [Kuangdai] I'm using python 3.11, under which pytorch does not support compile

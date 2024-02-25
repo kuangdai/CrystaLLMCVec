@@ -47,6 +47,25 @@ class TrainDefaults:
     dropout: float = 0.0  # for pretraining 0 is good, for finetuning try 0.1+
     bias: bool = False  # do we use bias inside LayerNorm and Linear layers?
 
+    ##################################
+    # for conditioning vector (cvec) #
+    ##################################
+    # main switch
+    activate_cvec: bool = False
+    # length of cvec
+    n_input_cvec: int = 2
+    # number of prefix virtual tokens
+    n_prefix_cvec: int = 4
+    # hidden size of CVecEncoder
+    n_hidden_cvec: int = 128
+    # dropout of CVecEncoder
+    dropout_cvec: float = 0.1
+    # layer-wise strategy
+    # True: all blocks share the same key-value features
+    # False: each block uses independent key-value features;
+    #        the size of CVecEncoder will become `n_layer` times larger
+    kv_shared_by_layers_cvec: bool = False
+
     # AdamW optimizer
     learning_rate: float = 6e-4  # max learning rate
     max_iters: int = 600000  # total number of training iterations
@@ -134,6 +153,12 @@ if __name__ == "__main__":
         required=True,
     )
 
+    # load cvec
+    cvec_train, cvec_val = None, None
+    if C.activate_cvec:
+        cvec_train = np.load(os.path.join(C.dataset, "cvec_train.npz"))['arr_0']
+        cvec_val = np.load(os.path.join(C.dataset, "cvec_val.npz"))['arr_0']
+
     def get_batch(split):
         data = train_data if split == "train" else val_data
 
@@ -154,7 +179,19 @@ if __name__ == "__main__":
             x, y = x.pin_memory().to(C.device, non_blocking=True), y.pin_memory().to(C.device, non_blocking=True)
         else:
             x, y = x.to(C.device), y.to(C.device)
-        return x, y
+
+        # get cvec batch
+        cvec_batch = None
+        if C.activate_cvec:
+            # [Kuangdai] I am not sure if this is right way to find data index
+            ix_cvec = ix // C.block_size
+            cvec = cvec_train if split == "train" else cvec_val
+            cvec_batch = torch.from_numpy(cvec[ix_cvec]).to(ptdtype)
+            if device_type == "cuda":
+                cvec_batch = cvec_batch.pin_memory().to(C.device, non_blocking=True)
+            else:
+                cvec_batch = cvec_batch.to(C.device)
+        return x, y, cvec_batch
 
     iter_num = 0
     best_val_loss = 1e9
@@ -168,7 +205,13 @@ if __name__ == "__main__":
         print(f"Found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
     model_args = dict(n_layer=C.n_layer, n_head=C.n_head, n_embd=C.n_embd, block_size=C.block_size,
-                      bias=C.bias, vocab_size=None, dropout=C.dropout)
+                      bias=C.bias, vocab_size=None, dropout=C.dropout,
+                      activate_cvec=C.activate_cvec,
+                      n_input_cvec=C.n_input_cvec,
+                      n_prefix_cvec=C.n_prefix_cvec,
+                      n_hidden_cvec=C.n_hidden_cvec,
+                      dropout_cvec=C.dropout_cvec,
+                      kv_shared_by_layers_cvec=C.kv_shared_by_layers_cvec)
     if C.init_from == "scratch":
         print("Initializing a new model from scratch...")
         if meta_vocab_size is None:
@@ -193,7 +236,8 @@ if __name__ == "__main__":
         for k, v in list(state_dict.items()):
             if k.startswith(unwanted_prefix):
                 state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-        model.load_state_dict(state_dict)
+        # [Kuangdai] the pretrained model may not contain CVecEncoder, so adding `strict=False`
+        model.load_state_dict(state_dict, strict=False)
         iter_num = checkpoint["iter_num"]
         best_val_loss = checkpoint["best_val_loss"]
 
@@ -208,7 +252,8 @@ if __name__ == "__main__":
 
     optimizer = model.configure_optimizers(C.weight_decay, C.learning_rate, (C.beta1, C.beta2))
     if C.init_from == "resume":
-        optimizer.load_state_dict(checkpoint["optimizer"])
+        if not C.activate_cvec:  # with new modules we cannot resume optimizer state
+            optimizer.load_state_dict(checkpoint["optimizer"])
 
     if C.compile:
         print("Compiling the model (takes a ~minute)...")
@@ -223,9 +268,9 @@ if __name__ == "__main__":
         for split, eval_iters in [("train", C.eval_iters_train), ("val", C.eval_iters_val)]:
             losses = torch.zeros(eval_iters)
             for k in range(eval_iters):
-                X, Y = get_batch(split)
+                X, Y, cvec = get_batch(split)
                 with ctx:
-                    logits, loss = model(X, Y)
+                    logits, loss = model(X, Y, cvec)
                 losses[k] = loss.item()
             out[split] = losses.mean()
         model.train()
@@ -246,7 +291,7 @@ if __name__ == "__main__":
         return C.min_lr + coeff * (C.learning_rate - C.min_lr)
 
     # training loop
-    X, Y = get_batch("train")
+    X, Y, cvec = get_batch("train")
     t0 = time.time()
     local_iter_num = 0  # number of iterations in the lifetime of this process
     running_mfu = -1.0
@@ -282,9 +327,9 @@ if __name__ == "__main__":
         # and using the GradScaler if data type is float16
         for micro_step in range(C.gradient_accumulation_steps):
             with ctx:
-                logits, loss = model(X, Y)
+                logits, loss = model(X, Y, cvec)
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
-            X, Y = get_batch("train")
+            X, Y, cvec = get_batch("train")
             # backward pass, with gradient scaling if training in fp16
             scaler.scale(loss).backward()
         # clip the gradient
